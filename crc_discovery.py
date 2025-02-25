@@ -78,6 +78,117 @@ def walk_snmp_table(ip, oid, community='public'):
     
     return results
 
+def is_network_switch(ip, community='public'):
+    """
+    Verilen IP adresinin bir switch olup olmadığını kontrol eder
+    
+    Temel strateji:
+    1. SNMP protokolü ile iletişim kurulabiliyorsa
+    2. Bridge MIB (dot1dBaseBridgeAddress) veya
+       Ethernet-like interface sayısı kontrolü gibi
+       daha genel yaklaşımlar kullanarak switch olup
+       olmadığını belirle
+    """
+    print(f"  - '{ip}' adresinin bir switch olup olmadığı kontrol ediliyor...")
+    
+    # sysDescr kontrolü - genellikle switch model bilgisini içerir
+    sys_descr_result = get_snmp_data(ip, '1.3.6.1.2.1.1.1.0', community)
+    
+    # sysObjectID kontrolü - OID bilgisi
+    object_id_result = get_snmp_data(ip, '1.3.6.1.2.1.1.2.0', community)
+    
+    # sysServices kontrolü (Layer 2 cihazı mı?)
+    services_result = get_snmp_data(ip, '1.3.6.1.2.1.1.7.0', community)
+    
+    if not sys_descr_result and not object_id_result and not services_result:
+        print(f"    - SNMP verileri alınamadı, bu bir switch olmayabilir")
+        return False
+    
+    # 1. Yöntem: sysDescr içinde "switch" kelimesi geçiyor mu?
+    is_switch_by_desc = False
+    if sys_descr_result:
+        sys_descr = sys_descr_result[0][1].prettyPrint().lower()
+        # Switch terimini içeriyor mu?
+        if "switch" in sys_descr:
+            print(f"    - sysDescr'da 'switch' kelimesi bulundu: {sys_descr}")
+            return True
+        
+        # Yaygın switch üreticilerin modellerini içeriyor mu?
+        switch_keywords = ["catalyst", "nexus", "procurve", "aruba", "juniper", "extreme", "dell emc", 
+                          "powerconnect", "netgear", "huawei", "d-link", "edge-core", "allied telesis"]
+        
+        for keyword in switch_keywords:
+            if keyword in sys_descr:
+                print(f"    - sysDescr'da switch modeli bulundu: {keyword}")
+                return True
+    
+    # 2. Yöntem: Bridge MIB varlığı kontrolü (SNMP walk dot1dBaseBridgeAddress)
+    bridge_address = walk_snmp_table(ip, '1.3.6.1.2.1.17.1.1.0', community)
+    if bridge_address:
+        print(f"    - Bridge MIB (dot1dBaseBridgeAddress) bulundu, bu bir switch")
+        return True
+    
+    # 3. Yöntem: Ethernet benzeri arayüz sayısını kontrol et
+    if_type_ethernet = 6  # Ethernet-like interface tipi
+    ethernet_interfaces = 0
+    
+    # ifType tablosunu al ve Ethernet benzeri arayüzleri say
+    if_types = walk_snmp_table(ip, '1.3.6.1.2.1.2.2.1.3', community)
+    if if_types:
+        for if_type_entry in if_types:
+            if int(if_type_entry[1]) == if_type_ethernet:
+                ethernet_interfaces += 1
+        
+        # Birden fazla Ethernet arayüzü varsa, muhtemelen bir switch
+        if ethernet_interfaces > 4:
+            print(f"    - {ethernet_interfaces} adet Ethernet arayüzü bulundu, bu bir switch olabilir")
+            return True
+    
+    # 4. Yöntem: sysServices değerini kontrol et (Layer 2 ve Layer 3 cihazları)
+    if services_result:
+        services = int(services_result[0][1])
+        
+        # Layer 2 (2^2 = 4) bit'i kontrol et
+        is_layer2 = (services & 4) != 0
+        
+        # Hem Layer 2 hem de Layer 3 hizmetleri (switch veya router olabilir)
+        is_layer2_3 = is_layer2 and ((services & 8) != 0)  # Layer 3 (2^3 = 8)
+        
+        if is_layer2_3:
+            print(f"    - Hem Layer 2 hem Layer 3 hizmetleri sunuyor, bu bir L3 switch olabilir (sysServices: {services})")
+            return True
+        elif is_layer2:
+            print(f"    - Layer 2 hizmetleri sunuyor, bu bir switch olabilir (sysServices: {services})")
+            return True
+    
+    # 5. Yöntem: Yaygın switch üreticileri için OID kontrolü
+    if object_id_result:
+        object_id = str(object_id_result[0][1])
+        switch_oid_patterns = [
+            "1.3.6.1.4.1.9.1",     # Cisco
+            "1.3.6.1.4.1.4526",    # NetGear
+            "1.3.6.1.4.1.11.2.3.7", # HP
+            "1.3.6.1.4.1.1916",    # Extreme
+            "1.3.6.1.4.1.171",     # D-Link
+            "1.3.6.1.4.1.3955",    # Linksys
+            "1.3.6.1.4.1.674.10895", # Dell
+            "1.3.6.1.4.1.2636",    # Juniper
+            "1.3.6.1.4.1.2011",    # Huawei
+            "1.3.6.1.4.1.6486",    # Alcatel-Lucent
+            "1.3.6.1.4.1.45",      # Avaya/Nortel
+            "1.3.6.1.4.1.800",     # Axis
+            "1.3.6.1.4.1.25506"    # H3C
+        ]
+        
+        for oid_pattern in switch_oid_patterns:
+            if oid_pattern in object_id:
+                print(f"    - Switch üreticisi OID'si bulundu: {oid_pattern}")
+                return True
+    
+    # Hiçbir switch belirtisi bulunamadı
+    print(f"    - Bu cihaz bir switch olmayabilir")
+    return False
+
 def check_crc_errors(ip, community='public'):
     """
     Switch'teki CRC hatalarını kontrol eder
@@ -204,10 +315,13 @@ def explore_network(start_ip, community='public'):
         # LLDP komşularını al
         neighbors = get_lldp_neighbors(current_ip, community)
         
-        # Yeni komşuları kuyruğa ekle
+        # Yeni komşuları kuyruğa ekle, ancak sadece switch olan cihazları
         for neighbor_ip in neighbors:
             if neighbor_ip not in visited_ips:
-                queue.append(neighbor_ip)
+                if is_network_switch(neighbor_ip, community):
+                    queue.append(neighbor_ip)
+                else:
+                    print(f"  - {neighbor_ip} bir switch değil, taranmayacak")
         
         # Konsola ilerlemeyi yazdır
         print(f"\n[*] Toplam ziyaret edilen cihaz sayısı: {len(visited_ips)}")
